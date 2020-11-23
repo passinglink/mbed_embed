@@ -12,6 +12,7 @@ target_compile_options(mbedtls PUBLIC -m32)
 target_link_options(mbedtls PUBLIC -m32)
 
 add_executable(mbed_embed mbed_embed.cpp)
+target_include_directories(mbed_embed PUBLIC ../../passinglink/src)
 target_link_libraries(mbed_embed mbedtls)
 target_compile_options(mbed_embed PUBLIC -m32 -std=c++17)
 target_link_options(mbed_embed PUBLIC -m32)

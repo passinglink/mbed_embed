@@ -2,165 +2,150 @@
 #error You probably want to build this in 32-bit mode.
 #endif
 
+#undef _NDEBUG
+#include <assert.h>
 #include <err.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include <map>
+#include <string>
+#include <type_traits>
+#include <vector>
 
 #include <mbedtls/pk.h>
 #include <mbedtls/rsa.h>
 
-#define PRINT_FIELD(var_name, x, name) print_field(var_name, #name, x.name)
-#define PRINT_FIELD_PTR(var_name, x, name) print_field(var_name, #name, x->name)
+#include "provisioning_types.h"
 
-static FILE* f;
-static FILE* limbs;
-
-static int indentation;
-struct scoped_indent {
-  scoped_indent() {
-    ++indentation;
+struct Partition {
+  explicit Partition(uint32_t begin_address, uint32_t partition_size)
+      : begin_address_(begin_address), current_offset_(0), partition_size_(partition_size) {
+    // TODO: Assert that we start on a reasonable alignment boundary.
+    data_.reserve(partition_size);
   }
 
-  ~scoped_indent() {
-    --indentation;
+  uint32_t size() const { return data_.size(); }
+  const void* data() const { return data_.data(); }
+
+  void build(ProvisioningVersion version, std::string board_name, const char serial[16],
+             const char signature[256], mbedtls_rsa_context* rsa_context) {
+    ProvisioningData* pd = allocate<ProvisioningData>(1);
+    pd->version = version;
+    assert(board_name.size() < sizeof(pd->board_name));
+    strcpy(pd->board_name, board_name.c_str());
+
+    PS4Key* ps4_key = allocate<PS4Key>(1);
+    pd->ps4_key = to_flash(ps4_key);
+    memcpy(ps4_key->serial, serial, sizeof(ps4_key->serial));
+    memcpy(ps4_key->signature, signature, sizeof(ps4_key->signature));
+
+    ps4_key->rsa_context = clone(rsa_context);
+    assert(partition_size_ >= data_.size());
   }
+
+ private:
+  // Returns a to_flash'ed pointer to a copied mbedtls_rsa_context.
+  mbedtls_rsa_context* clone(const mbedtls_rsa_context* rsa) {
+    mbedtls_rsa_context* result = allocate<mbedtls_rsa_context>(1);
+
+    // Fields to copy directly.
+    result->ver = rsa->ver;
+    result->len = rsa->len;
+    result->padding = rsa->padding;
+    result->hash_id = rsa->hash_id;
+
+    // mbedtls_mpi fields:
+    result->N = clone(rsa->N);
+    result->E = clone(rsa->E);
+    result->D = clone(rsa->D);
+    result->P = clone(rsa->P);
+    result->Q = clone(rsa->Q);
+    result->DP = clone(rsa->DP);
+    result->DQ = clone(rsa->DQ);
+    result->QP = clone(rsa->QP);
+    result->RN = clone(rsa->RN);
+    result->RP = clone(rsa->RP);
+    result->RQ = clone(rsa->RQ);
+    result->Vi = clone(rsa->Vi);
+    result->Vf = clone(rsa->Vf);
+    return to_flash(result);
+  }
+
+  mbedtls_mpi clone(mbedtls_mpi mpi) {
+    mbedtls_mpi result;
+    result.s = mpi.s;
+    result.n = mpi.n;
+
+    if (mpi.p) {
+      mbedtls_mpi_uint* p = allocate<mbedtls_mpi_uint>(mpi.n);
+      memcpy(p, mpi.p, sizeof(*p) * mpi.n);
+      result.p = to_flash(p);
+    }
+    return result;
+  }
+
+  template <typename T>
+  T* to_flash(T* p) {
+    uintptr_t offset = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(data_.data());
+    return reinterpret_cast<T*>(begin_address_ + offset);
+  }
+
+  uint32_t align(uint32_t addr, size_t alignment) {
+    uint32_t mask = (1 << alignment) - 1;
+    if (addr & mask) {
+      addr += (1 << alignment) - (addr & mask);
+    }
+    return addr;
+  }
+
+ public:
+  template <typename T>
+  T* allocate(size_t count) {
+    static_assert(std::is_trivially_destructible_v<T>);
+
+    current_offset_ = align(current_offset_, alignof(T));
+    data_.resize(current_offset_ + count * sizeof(T));
+
+    T* p = reinterpret_cast<T*>(&data_[current_offset_]);
+    current_offset_ = data_.size();
+    return p;
+  }
+
+ private:
+  uint32_t begin_address_;
+  uint32_t current_offset_;
+  uint32_t partition_size_;
+
+  std::vector<char> data_;
 };
 
-void print_indent(FILE* fp = f) {
-  for (int i = 0; i < indentation; ++i) {
-    fprintf(fp, "  ");
-  }
-}
-
-void print_field(const char* var_name, const char* field_name, int value) {
-  print_indent();
-  fprintf(f, ".%s = %d,\n", field_name, value);
-}
-
-void print_field(const char* var_name, const char* field_name, size_t value) {
-  print_indent();
-  fprintf(f, ".%s = %zu,\n", field_name, value);
-}
-
-void print_field(const char* var_name, const char* field_name, mbedtls_mpi& value) {
-  print_indent();
-  fprintf(f, ".%s = {\n", field_name);
-
-  {
-    scoped_indent _;
-    PRINT_FIELD(var_name, value, s);
-    PRINT_FIELD(var_name, value, n);
-    print_indent();
-    if (value.p) {
-      fprintf(f, ".p = const_cast<mbedtls_mpi_uint*>(__limbs_%s_%s),\n", var_name, field_name);
-      fprintf(limbs, "static const mbedtls_mpi_uint __limbs_%s_%s[%zu] = {\n", var_name, field_name, value.n);
-      fprintf(limbs, "  ");
-      for (size_t i = 0; i < value.n; ++i) {
-        fprintf(limbs, "%lu, ", static_cast<unsigned long>(value.p[i]));
-      }
-      fprintf(limbs, "\n};\n");
-
-    } else {
-      fprintf(f, ".p = 0,\n");
-    }
+static uint32_t parse_u32(const char* arg) {
+  char* end;
+  if (*arg == '\0') {
+    errx(1, "empty argument");
   }
 
-  print_indent();
-  fprintf(f, "},\n");
-}
-
-void print_array(const char* name, const unsigned char* data, size_t len) {
-  print_indent(stdout);
-  printf("const unsigned char %s[%zu] = {\n", name, len);
-  {
-    scoped_indent _;
-    print_indent(stdout);
-    for (size_t i = 0; i < len; ++i) {
-      printf("0x%02x, ", data[i]);
-    }
+  long long result = strtoll(arg, &end, 0);
+  if (*end != '\0' || result < 0 || result > UINT32_MAX) {
+    errx(1, "invalid argument: '%s'", arg);
   }
-  printf("\n};\n");
-}
-
-void print_definition(mbedtls_rsa_context* rsa, const unsigned char* ds4_serial,
-                      const unsigned char* ds4_signature) {
-  char* struct_buf = nullptr;
-  size_t struct_len = 0;
-
-  char* limbs_buf = nullptr;
-  size_t limbs_len = 0;
-
-  f = open_memstream(&struct_buf, &struct_len);
-  limbs = open_memstream(&limbs_buf, &limbs_len);
-
-  const char* name = "ds4_key";
-  fprintf(f, "const struct mbedtls_rsa_context __%s = {\n", name);
-  {
-    scoped_indent _;
-    PRINT_FIELD_PTR(name, rsa, ver);
-    PRINT_FIELD_PTR(name, rsa, len);
-    PRINT_FIELD_PTR(name, rsa, N);
-    PRINT_FIELD_PTR(name, rsa, E);
-
-    PRINT_FIELD_PTR(name, rsa, D);
-    PRINT_FIELD_PTR(name, rsa, P);
-    PRINT_FIELD_PTR(name, rsa, Q);
-
-    PRINT_FIELD_PTR(name, rsa, DP);
-    PRINT_FIELD_PTR(name, rsa, DQ);
-    PRINT_FIELD_PTR(name, rsa, QP);
-
-    PRINT_FIELD_PTR(name, rsa, RN);
-
-    PRINT_FIELD_PTR(name, rsa, RP);
-    PRINT_FIELD_PTR(name, rsa, RQ);
-
-    PRINT_FIELD_PTR(name, rsa, Vi);
-    PRINT_FIELD_PTR(name, rsa, Vf);
-
-    print_indent();
-    fprintf(f, ".padding = MBEDTLS_RSA_PKCS_V21,\n");
-
-    print_indent();
-    fprintf(f, ".hash_id = MBEDTLS_MD_SHA256,\n");
-  }
-
-  fprintf(f, "};\n");
-
-  fclose(f);
-  fclose(limbs);
-
-  printf("%s\n%s", limbs_buf, struct_buf);
-
-  unsigned char ds4_key_n[256];
-  if (mbedtls_mpi_write_binary(&rsa->N, ds4_key_n, sizeof(ds4_key_n)) != 0) {
-    errx(1, "failed to write ds4_key_n as big endian");
-  }
-
-  print_array("__ds4_key_n", ds4_key_n, sizeof(ds4_key_n));
-
-  unsigned char ds4_key_e[256];
-  if (mbedtls_mpi_write_binary(&rsa->E, ds4_key_e, sizeof(ds4_key_e)) != 0) {
-    errx(1, "failed to write ds4_key_e as big endian");
-  }
-
-  print_array("__ds4_key_e", ds4_key_e, sizeof(ds4_key_e));
-
-  print_array("__ds4_serial", ds4_serial, 16);
-  print_array("__ds4_signature", ds4_signature, 256);
-  printf("\n#define HAVE_DS4_KEY 1\n");
+  return result;
 }
 
 int main(int argc, char** argv) {
-  if (argc != 4) {
-    errx(1, "usage: mbed_embed PRIVATE_KEY_DER SERIAL SIGNATURE");
+  if (argc != 7) {
+    errx(1, "usage: mbed_embed PARTITION_BEGIN PARTITION_SIZE BOARD_NAME PRIVATE_KEY_DER SERIAL SIGNATURE");
   }
+
+  uint32_t partition_begin = parse_u32(argv[1]);
+  uint32_t partition_size = parse_u32(argv[2]);
+  const char* board_name = argv[3];
 
   unsigned char der_buf[4096];
   size_t der_len;
   {
-    FILE* f = fopen(argv[1], "r");
+    FILE* f = fopen(argv[4], "r");
     if (!f) {
       err(1, "failed to open '%s'", argv[1]);
     }
@@ -173,9 +158,9 @@ int main(int argc, char** argv) {
     fclose(f);
   }
 
-  unsigned char serial_buf[17];
+  char serial_buf[17];
   {
-    FILE* f = fopen(argv[2], "r");
+    FILE* f = fopen(argv[5], "r");
     if (!f) {
       err(1, "failed to open '%s'", argv[2]);
     }
@@ -188,9 +173,9 @@ int main(int argc, char** argv) {
     fclose(f);
   }
 
-  unsigned char signature_buf[257];
+  char signature_buf[257];
   {
-    FILE* f = fopen(argv[3], "r");
+    FILE* f = fopen(argv[6], "r");
     if (!f) {
       err(1, "failed to open '%s'", argv[3]);
     }
@@ -228,5 +213,10 @@ int main(int argc, char** argv) {
     errx(1, "failed to populate RN");
   }
 
-  print_definition(rsa, serial_buf, signature_buf);
+  rsa->padding = MBEDTLS_RSA_PKCS_V21;
+  rsa->hash_id = MBEDTLS_MD_SHA256;
+
+  Partition p(partition_begin, partition_size);
+  p.build(ProvisioningVersion::V1, board_name, serial_buf, signature_buf, rsa);
+  fwrite(p.data(), p.size(), 1, stdout);
 }

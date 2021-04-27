@@ -147,12 +147,12 @@ int main(int argc, char** argv) {
   {
     FILE* f = fopen(argv[4], "r");
     if (!f) {
-      err(1, "failed to open '%s'", argv[1]);
+      err(1, "failed to open '%s'", argv[4]);
     }
 
     der_len = fread(der_buf, 1, sizeof(der_buf), f);
     if (der_len == 0) {
-      errx(1, "failed to read from '%s'", argv[1]);
+      errx(1, "failed to read from '%s'", argv[4]);
     }
 
     fclose(f);
@@ -162,12 +162,12 @@ int main(int argc, char** argv) {
   {
     FILE* f = fopen(argv[5], "r");
     if (!f) {
-      err(1, "failed to open '%s'", argv[2]);
+      err(1, "failed to open '%s'", argv[5]);
     }
 
     size_t len = fread(serial_buf, 1, sizeof(serial_buf), f);
     if (len != 16) {
-      err(1, "failed to read from '%s': got %zu bytes", argv[2], len);
+      err(1, "failed to read from '%s': got %zu bytes", argv[5], len);
     }
 
     fclose(f);
@@ -177,12 +177,12 @@ int main(int argc, char** argv) {
   {
     FILE* f = fopen(argv[6], "r");
     if (!f) {
-      err(1, "failed to open '%s'", argv[3]);
+      err(1, "failed to open '%s'", argv[6]);
     }
 
     size_t len = fread(signature_buf, 1, sizeof(signature_buf), f);
     if (len != 256) {
-      err(1, "failed to read from '%s': got %zu bytes", argv[3], len);
+      err(1, "failed to read from '%s': got %zu bytes", argv[6], len);
     }
 
     fclose(f);
